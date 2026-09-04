@@ -140,6 +140,7 @@ impl<B: Backend> Terminal<B> {
             viewport_area,
             last_known_area: area,
             last_known_cursor_pos: cursor_pos,
+            last_frame_cursor_position: None,
             frame_count: 0,
         })
     }

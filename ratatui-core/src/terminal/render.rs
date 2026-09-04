@@ -295,10 +295,26 @@ impl<B: Backend> Terminal<B> {
 
         // The cursor position can only be changed after the frame is flushed to stdout.
         match cursor_position {
-            None => self.hide_cursor()?,
+            None => {
+                self.hide_cursor()?;
+                self.last_frame_cursor_position = None;
+            }
             Some(position) => {
-                self.show_cursor()?;
-                self.set_cursor_position(position)?;
+                // Only emit `Show` + `MoveTo` when the cursor is not already visible at this
+                // exact position. Consecutive frames that request an unchanged caret (common in
+                // streaming TUIs, where only content above the input grows) then emit no
+                // redundant escape sequences. This avoids repeatedly re-showing the cursor,
+                // which some terminals use to re-arm the cursor blink, and trims per-frame
+                // output.
+                if self.hidden_cursor || self.last_frame_cursor_position != Some(position) {
+                    self.show_cursor()?;
+                    self.set_cursor_position(position)?;
+                } else {
+                    // Already visible at `position`: nothing to emit, but keep the resize-tracking
+                    // position accurate (it also reflects the last written cell from `flush`).
+                    self.last_known_cursor_pos = position;
+                }
+                self.last_frame_cursor_position = Some(position);
             }
         }
 
@@ -860,6 +876,158 @@ mod tests {
         assert_eq!(
             terminal.frame_count, 1,
             "successful draw increments frame_count"
+        );
+    }
+
+    /// A [`TestBackend`] wrapper that records cursor operations so tests can assert that
+    /// consecutive frames do not emit redundant `Show`/`MoveTo` escape sequences.
+    #[derive(Debug, Clone, Eq, PartialEq)]
+    struct RecordingCursorBackend {
+        inner: TestBackend,
+        hide_cursor_calls: usize,
+        show_cursor_calls: usize,
+        set_cursor_position_calls: usize,
+    }
+
+    impl RecordingCursorBackend {
+        fn new(inner: TestBackend) -> Self {
+            Self {
+                inner,
+                hide_cursor_calls: 0,
+                show_cursor_calls: 0,
+                set_cursor_position_calls: 0,
+            }
+        }
+    }
+
+    impl Backend for RecordingCursorBackend {
+        type Error = TestError;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a crate::buffer::Cell)>,
+        {
+            self.inner.draw(content).map_err(|err| match err {})
+        }
+
+        fn append_lines(&mut self, n: u16) -> Result<(), Self::Error> {
+            self.inner.append_lines(n).map_err(|err| match err {})
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.hide_cursor_calls += 1;
+            self.inner.hide_cursor().map_err(|err| match err {})
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.show_cursor_calls += 1;
+            self.inner.show_cursor().map_err(|err| match err {})
+        }
+
+        fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+            self.inner.get_cursor_position().map_err(|err| match err {})
+        }
+
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.set_cursor_position_calls += 1;
+            self.inner
+                .set_cursor_position(position)
+                .map_err(|err| match err {})
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.inner.clear().map_err(|err| match err {})
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
+            self.inner
+                .clear_region(clear_type)
+                .map_err(|err| match err {})
+        }
+
+        fn size(&self) -> Result<crate::layout::Size, Self::Error> {
+            self.inner.size().map_err(|err| match err {})
+        }
+
+        fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+            self.inner.window_size().map_err(|err| match err {})
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.inner.flush().map_err(|err| match err {})
+        }
+
+        #[cfg(feature = "scrolling-regions")]
+        fn scroll_region_up(
+            &mut self,
+            region: core::ops::Range<u16>,
+            line_count: u16,
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .scroll_region_up(region, line_count)
+                .map_err(|err| match err {})
+        }
+
+        #[cfg(feature = "scrolling-regions")]
+        fn scroll_region_down(
+            &mut self,
+            region: core::ops::Range<u16>,
+            line_count: u16,
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .scroll_region_down(region, line_count)
+                .map_err(|err| match err {})
+        }
+    }
+
+    /// Consecutive frames that request an unchanged cursor position must not re-emit `Show` +
+    /// `MoveTo`, while a changed position or a hidden cursor must.
+    #[test]
+    fn draw_skips_redundant_cursor_emission_when_position_unchanged() {
+        let backend = RecordingCursorBackend::new(TestBackend::new(3, 2));
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // First frame places the caret at (2, 1); the cursor must be shown and moved.
+        terminal
+            .draw(|frame| {
+                frame.set_cursor_position(Position { x: 2, y: 1 });
+                frame.buffer_mut()[(0, 0)] = Cell::new("x");
+            })
+            .unwrap();
+        assert_eq!(terminal.backend().show_cursor_calls, 1, "first frame shows the cursor");
+        assert_eq!(
+            terminal.backend().set_cursor_position_calls, 1,
+            "first frame moves the cursor"
+        );
+
+        // A second frame at the same caret must not re-emit `Show`/`MoveTo`.
+        terminal
+            .draw(|frame| {
+                frame.set_cursor_position(Position { x: 2, y: 1 });
+                frame.buffer_mut()[(0, 0)] = Cell::new("y");
+            })
+            .unwrap();
+        assert_eq!(
+            terminal.backend().show_cursor_calls, 1,
+            "unchanged caret must not re-show the cursor"
+        );
+        assert_eq!(
+            terminal.backend().set_cursor_position_calls, 1,
+            "unchanged caret must not re-MoveTo the cursor"
+        );
+
+        // A moved caret must emit.
+        terminal
+            .draw(|frame| {
+                frame.set_cursor_position(Position { x: 1, y: 1 });
+            })
+            .unwrap();
+        assert_eq!(
+            terminal.backend().set_cursor_position_calls, 2,
+            "a moved caret must re-emit MoveTo"
         );
     }
 }

@@ -450,6 +450,16 @@ where
     /// Inline viewports use this during [`Terminal::resize`] to preserve the cursor's relative
     /// position within the viewport.
     last_known_cursor_pos: Position,
+    /// Cursor position applied at the end of the last successful draw.
+    ///
+    /// This is the position the caret was placed at by [`Terminal::apply_buffer_with_cursor`]
+    /// during the previous frame (`Some`) or `None` if the cursor was hidden. It is separate from
+    /// [`Terminal::last_known_cursor_pos`] (which [`Terminal::flush`] also overwrites with the
+    /// last written cell), so that consecutive frames requesting an unchanged caret can skip the
+    /// redundant `Show` + `MoveTo` escape sequences.
+    ///
+    /// [`Terminal::apply_buffer_with_cursor`]: crate::terminal::Terminal::apply_buffer_with_cursor
+    last_frame_cursor_position: Option<Position>,
     /// Number of frames rendered so far.
     ///
     /// This increments after each successful [`Terminal::draw`] / [`Terminal::try_draw`] and wraps
