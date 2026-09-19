@@ -112,14 +112,37 @@ impl<B: Backend> Terminal<B> {
     where
         F: FnOnce(&mut Buffer),
     {
+        // Insertions only run for inline viewports with a non-empty display. For every other
+        // case `insert_before` is a no-op, so the physical cursor does not move and the
+        // next-frame `MoveTo` dedup tracking must not be invalidated.
+        let did_insert = matches!(
+            self.viewport,
+            Viewport::Inline(_) if self.last_known_area.height > 0
+        );
+
         match self.viewport {
-            Viewport::Inline(_) if self.last_known_area.height == 0 => Ok(()),
+            Viewport::Inline(_) if self.last_known_area.height == 0 => {}
             #[cfg(feature = "scrolling-regions")]
-            Viewport::Inline(_) => self.insert_before_scrolling_regions(height, draw_fn),
+            Viewport::Inline(_) => {
+                self.insert_before_scrolling_regions(height, draw_fn)?;
+            }
             #[cfg(not(feature = "scrolling-regions"))]
-            Viewport::Inline(_) => self.insert_before_no_scrolling_regions(height, draw_fn),
-            _ => Ok(()),
+            Viewport::Inline(_) => {
+                self.insert_before_no_scrolling_regions(height, draw_fn)?;
+            }
+            _ => {}
         }
+
+        if did_insert {
+            // `insert_before` draws lines and scrolls the terminal directly on the backend, which
+            // moves the physical cursor outside the `apply_buffer_with_cursor` flow. Invalidate
+            // the next-frame `MoveTo` dedup tracking so a following `draw` always re-emits `Show`
+            // + `MoveTo` to reposition the caret, even if it requests an otherwise unchanged
+            // position.
+            self.last_frame_cursor_position = None;
+        }
+
+        Ok(())
     }
 
     /// Implement `Self::insert_before` using standard backend capabilities.
@@ -501,6 +524,67 @@ mod tests {
             .unwrap();
 
         assert_eq!(terminal.backend().scrollback(), &scrollback);
+    }
+
+    #[test]
+    fn insert_before_invalidates_move_dedup_tracking() {
+        let mut backend = TestBackend::new(10, 10);
+        backend
+            .set_cursor_position(Position { x: 0, y: 6 })
+            .unwrap();
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(4),
+            },
+        )
+        .unwrap();
+
+        terminal
+            .draw(|frame| {
+                frame.set_cursor_position(Position { x: 3, y: 7 });
+            })
+            .unwrap();
+        assert_eq!(
+            terminal.last_frame_cursor_position,
+            Some(Position { x: 3, y: 7 }),
+            "a draw with a caret records the dedup position"
+        );
+
+        terminal
+            .insert_before(2, |buf| {
+                buf.set_string(0, 0, "INSERTED00", Style::default());
+            })
+            .unwrap();
+
+        assert_eq!(
+            terminal.last_frame_cursor_position, None,
+            "insert_before must invalidate the MoveTo dedup tracking"
+        );
+    }
+
+    #[test]
+    fn insert_before_is_noop_for_non_inline_and_preserves_dedup() {
+        let mut terminal = Terminal::new(TestBackend::new(3, 2)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                frame.set_cursor_position(Position { x: 2, y: 1 });
+            })
+            .unwrap();
+        assert_eq!(
+            terminal.last_frame_cursor_position,
+            Some(Position { x: 2, y: 1 }),
+            "a draw with a caret records the dedup position"
+        );
+
+        terminal.insert_before(1, |_buf| ()).unwrap();
+
+        assert_eq!(
+            terminal.last_frame_cursor_position,
+            Some(Position { x: 2, y: 1 }),
+            "a no-op insert_before on a non-inline viewport must not invalidate the tracking"
+        );
     }
 
     #[cfg(not(feature = "scrolling-regions"))]
